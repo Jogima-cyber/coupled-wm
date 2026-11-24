@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+runs/
+logs/
+outputs/
+wandb/
+*.pt
+*.pth
+*.safetensors
+*.h5
+/weights/
+/data
+/build/
+/dist/

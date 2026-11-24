@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: Apache-2.0
+# RSSM (local world model) pretraining on the G1 data: the paper's warm-start recipe.
+#
+#   python -m coupled_wm.rssm.pretrain --config configs/rssm/g1_rssm_pretrain.yaml
+#   G1_DATA_ROOT=/path/to/g1 RUN_ROOT=/scratch/runs python -m coupled_wm.rssm.pretrain --config ...
+#
+# Run from the repository root (relative paths below are relative to the working directory; the
+# absolute run dir is logged at startup). Relaunching the same command continues from
+# <run_dir>/latest.pt; SIGTERM or SIGUSR1 saves it and exits.
+#
+# Paper run: XL RSSM at 64x64, batch 16 x 64 rows, Adam 1e-4, bf16, torch.compile, on 1 GPU
+# (about 1 h per epoch on an H100). Frames are resized on the fly from the 256x256 data with the
+# environment's resize, and row t pairs frame t with commands[t] - commands[t-1] (the
+# environment's convention; see coupled_wm/rssm/pretrain.py).
+# The result (run_dir/rssm_e10/) is the RL warm start (configs/rl/g1_dmo.yaml: rssm.pretrained).
+
+run_dir: ${RUN_ROOT:-runs}/g1_rssm
+seed: 42
+init_from: null                   # weights-only start: an RSSM pretrained dir or a bare state-dict .pt
+
+data:
+  # The paper's RSSM pool: 228 play chunks + 10 demonstration chunks (BGR, 256x256, 10 Hz);
+  # 238 files, 619,289 frames. G1_DATA_ROOT holds both directories.
+  dirs:
+    - ${G1_DATA_ROOT:-data/g1}/new_wm_h5_segmented_small/world_model
+    - ${G1_DATA_ROOT:-data/g1}/new_wm_h5_demos_segmented_small/world_model
+  include_globs: ["chunk_*.h5"]   # the play dir also holds patch_*.h5 files, not used here
+  exclude_globs: []
+  min_chunk_index: null
+  file_list: null
+  # Channel order of the stored images. It must be the order the tokenizer and the RL env read
+  # the same files with (their data.color_order; env.data.color_order: null takes the
+  # tokenizer's recorded order): the RSSM sees the env's RGB frames. It is recorded as
+  # preprocessing.h5_color_order in rssm_e{N}/config.json, and the RL trainer warns when it
+  # differs from the env's.
+  color_order: bgr
+  reward_key: rewards
+  # Same label transform as the world model's reward head (configs/world_model/
+  # g1_dynamics_reward.yaml), so the local and global reward heads learn the same labels. The G1
+  # data only holds rewards {0, 1}, so this is a no-op here (the paper's RSSM loader had no remap);
+  # remove it in both configs for data where 10.0 is a real reward.
+  reward_remap: {10.0: 2.0}
+  # Override files are matched to the data files by basename, so they need a pool whose file
+  # names are unique; this two-directory pool repeats chunk_0000.h5 .. chunk_0009.h5.
+  reward_override_dir: null
+  # Resized frames in RAM, built by every training process: float32 is the exact environment op
+  # (about 30 GB per process for this pool, so N x 30 GB under torchrun --nproc_per_node=N);
+  # uint8 needs 7.6 GB per process and re-quantises the resized frames (error <= 0.5/255).
+  # cache: false streams the same frames as the float32 cache from disk. A resumed run may switch
+  # between settings that give the same frames (no cache <-> float32 cache).
+  cache: true
+  cache_dtype: float32
+  cache_workers: 8
+  num_workers: 4
+
+model:
+  action_size: 22
+  image_size: 64
+  stochastic_size: 32
+  discrete_size: 32
+  recurrent_state_size: 4096
+  dense_units: 1024
+  channels_multiplier: 96
+  mlp_layers: 5
+  reward_model_bins: 255          # two-hot over symlog bins on [-20, 20]
+
+optim:                            # Adam, no weight decay, no gradient clipping
+  lr: 1e-4
+  eps: 1e-8
+
+train:
+  epochs: 10                      # paper warm start = rssm_e10; 36,600 steps per epoch on this pool
+  max_steps: null
+  batch_size: 16                  # sequences per optimizer step, over all processes
+  sequence_length: 64
+  kl_dynamic: 0.5
+  kl_representation: 0.1
+  kl_free_nats: 1.0
+  kl_regularizer: 1.0
+  precision: bf16
+  compile: true
+  compile_mode: reduce-overhead
+  log_every: 10
+  print_every: 1000
+  checkpoint_every_steps: 5000
+  save_every_epochs: 1
+
+validation:
+  holdout_every: 0                # e.g. 20 holds out every 20th file for a validation loss
+  num_batches: 50
+  every_steps: 5000
+
+wandb:
+  enabled: false
+  mode: offline
+  project: coupled-wm

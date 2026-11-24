@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+# G1 dynamics, stage 1 of 2: the backbone (no reward head). Stage 2: g1_dynamics_reward.yaml.
+#
+#   torchrun --nproc_per_node=4 -m coupled_wm.world_model.train_dynamics \
+#       --config configs/world_model/g1_dynamics_backbone.yaml [--set key=value ...]
+#
+# Run from the repository root, or set RUN_ROOT to an absolute path: re-running the same command
+# resumes from <run_dir>/latest.pt, and the first log lines name that file and say whether it
+# was found. A run stopped by a signal before max_updates exits with code 75, so a chained
+# `backbone && reward` stops there. The result is <run_dir>/latest.pt (input of the reward
+# stage) and <run_dir>/pretrained/. G1_DATA_ROOT is the directory holding
+# new_wm_h5_segmented_small/, WEIGHTS_DIR the one holding tokenizer/, RUN_ROOT the output root.
+#
+# torch.compile (the two compile keys) needs a C compiler at run time (gcc or clang on PATH, or
+# CC): Triton builds its kernel launchers with it. Without one (e.g. a minimal container image),
+# train eagerly: --set compile=null --set tokenizer.compile=null.
+#
+# Paper run (64 H100 = 16 nodes x 4 GPUs): this config from scratch, seed 42 + rank. Its jobs
+# ended at the cluster's time limit and the run stopped at update 49000 (epoch 23 of the nominal
+# 210, lr 9.93e-5), where the reward stage starts; here schedule.max_updates is the stopping
+# rule. The schedule numbers below reproduce the learning rates stored in the paper checkpoints
+# at updates 17000, 33000 and 49000 exactly.
+
+stage: backbone
+run_dir: ${RUN_ROOT:-runs}/g1_dynamics_backbone
+seed: 42
+init_from: null
+
+tokenizer:
+  # Pretrained dir (the released weights from scripts/download_weights.py, or the tokenizer
+  # run's <run_dir>/pretrained: --set tokenizer.path=runs/g1_tokenizer/pretrained) or a tokenizer
+  # training latest.pt. The reward stage must use the same tokenizer.
+  path: ${WEIGHTS_DIR:-weights}/tokenizer
+  # The frozen encoder sees the 128-frame clips with no temporal window (paper behaviour),
+  # although the G1 tokenizer was trained on 64-frame clips (also with no window). null: the
+  # window the tokenizer was trained with; a different value is logged as a warning.
+  context_len: 0
+  compile: max-autotune
+
+data:
+  # Paper backbone pool: the 228 chunk_*.h5 files (593,329 frames at 256x256, BGR, 10 Hz;
+  # 583,857 windows of 32 frames, 554,987 of 128). The patch*.h5 files were added later and
+  # are used by the reward stage only.
+  dirs:
+    - ${G1_DATA_ROOT:-data/g1}/new_wm_h5_segmented_small/world_model
+  include_globs: ["chunk_*.h5"]
+  exclude_globs: []
+  color_order: null     # channel order on disk; null: the tokenizer's recorded order (G1: bgr)
+  reward_key: null
+  num_workers: 4
+  sampler_seed: 42
+
+model:
+  # DreamerV4 dynamics (coupled_wm.world_model.models.build_dynamics); 679,796,768 parameters.
+  # The stage sets use_reward_head (false here).
+  action_dim: 22
+  num_latents: 256
+  latent_dim: 32
+  d_model: 1536
+  num_layers: 24
+  num_heads: 24
+  num_registers: 4
+  num_tau_levels: 128   # noise grid 1/128; 8 step sizes 2^0 .. 2^-7 (2^-7 = flow)
+  temporal_every: 4
+  mlp_ratio: 4.0
+  seq_len: 128          # RoPE table; must cover the longest clip
+  context_len: 96       # temporal sliding window, active on the 128-frame clips only
+  dropout: 0.0
+
+train:
+  short_len: 32
+  long_len: 128
+  long_every: 8         # updates 8, 16, ... (from 0; logged as 9, 17, ...) use 128-frame clips
+  global_batch: 256     # paper: 1 clip x 64 GPUs x 4 accumulation steps
+  micro_batch_per_gpu: 1
+  shortcut_fraction: 0.25   # every 4th micro-batch over (update, rank, micro-step): 3 flow + 1
+                            # shortcut per rank at 4 accumulation steps (paper), interleaved
+                            # otherwise; a quarter of every update, long-clip updates included
+
+optim:
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.1     # on all parameters
+  grad_clip: 1.0
+
+schedule:
+  # Nominal paper schedule: 210 epochs of 9122 micro-batches per rank (583,857 windows / 64
+  # ranks) at 4 accumulation steps: total = 210 * 9122 // 4, warmup = int(0.05 * total).
+  warmup_updates: 23945
+  total_updates: 478905
+  min_lr: 1.0e-8
+  max_updates: 49000    # where the paper backbone stopped
+
+loss:
+  # Each term is divided by its running RMS: an EMA of the squared loss, updated every
+  # micro-step with decay rms_decay ** (micro_batch_per_gpu * GPUs / rms_reference_windows).
+  # rms_decay is thus the decay over rms_reference_windows clips: per micro-step on the
+  # paper's 64 GPUs x 1 clip, and the same horizon in clips on any number of GPUs.
+  rms_decay: 0.99
+  rms_reference_windows: 64
+  rms_eps: 1.0e-8
+
+compile: max-autotune-no-cudagraphs
+
+checkpoint:
+  save_every_updates: 1000
+  save_every_minutes: 30  # also on wall time: on few GPUs 1000 updates take hours
+  archive_every_updates: null
+  export_on_save: false
+
+export:
+  preset: null
+
+logging:
+  print_every_updates: 200
+
+wandb:
+  enabled: false
+  mode: offline
+  project: coupled-wm

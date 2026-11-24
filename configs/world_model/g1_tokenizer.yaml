@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: Apache-2.0
+# DreamerV4 tokenizer of the G1 global world model (paper recipe).
+#
+#   torchrun --nproc_per_node=4 -m coupled_wm.world_model.train_tokenizer \
+#       --config configs/world_model/g1_tokenizer.yaml [--set key=value ...]
+#
+# Run from the repository root (relative paths below are relative to the working directory).
+# G1_DATA_ROOT is the directory holding new_wm_h5_segmented_small/; RUN_ROOT the output root.
+# Relaunching the same command continues from <run_dir>/latest.pt, on any number of GPUs for
+# which train.micro_batch_per_gpu * GPUs divides train.global_batch (1, 2, 4, ..., 256 here).
+# A run stopped by SIGUSR1/SIGTERM saves and exits with status 75; a finished run exits 0.
+#
+# Paper run. The paper tokenizer trained on 64 H100s (16 nodes x 4) with 1 window of 64
+# frames per GPU and 4 accumulation steps: global batch 256 windows. Its cosine schedule was
+# sized for 240 epochs of 5756 micro-steps (368,389 windows over 64 ranks): 240 * 5756 // 4 =
+# 345,360 updates in total, the first 1400 a linear warmup. The run was stopped at update
+# 45,000 (learning rate 9.61e-5, 96% of the peak); the published weights are that checkpoint.
+# Not reproduced by this config: the paper tokenizer was initialised from a tokenizer
+# pretrained on SOAR data (its proprio parameters started from random init), and its Adam
+# moments were reset once, at update 8634. Here training starts from scratch, because the
+# SOAR-pretrained tokenizer is not released (init_from can point at other weights).
+
+run_dir: ${RUN_ROOT:-runs}/g1_tokenizer
+seed: 42                       # model initialisation (same on every rank) and data order
+resume: auto                   # continue from <run_dir>/latest.pt; or a latest.pt of another run
+init_from: null                # weights-only start: a tokenizer pretrained dir or training checkpoint
+init_allow_missing: []         # glob patterns of "encoder.<key>" / "decoder.<key>" left at fresh init
+
+data:
+  # The G1 world-model data: one directory of chunk_*.h5 / patch*.h5 files, 256x256 frames
+  # stored BGR, 50-d raw proprio, 10 Hz.
+  dirs: ["${G1_DATA_ROOT:-data/g1}/new_wm_h5_segmented_small/world_model"]
+  # These globs select the paper tokenizer's pool, chunk_0000.h5 .. chunk_0146.h5: 147 of the
+  # 290 files of the released directory (the others were added after the tokenizer run). This
+  # selection gives exactly the counts of the paper run: 147 files, 381,186 frames, 201 segments
+  # of >= 64 frames and 368,389 windows. For new data use ["*.h5"]: these globs would keep only
+  # chunk_0000..chunk_0146 of a larger chunk_NNNN.h5 pool.
+  include_globs: ["chunk_00[0-9][0-9].h5", "chunk_01[0-3][0-9].h5", "chunk_014[0-6].h5"]
+  exclude_globs: []
+  min_chunk_index: null
+  file_list: null
+  window: 64                   # frames per training clip (<= model.seq_len)
+  stride: 1                    # every start frame of every segment is a window
+  color_order: bgr             # channel order of the h5 images (G1: bgr; most other data: rgb).
+                               # The model always sees RGB; set the same value in the dynamics,
+                               # RSSM and RL configs.
+  control_hz: 10               # recorded in the exported config.json
+  shuffle: true
+  num_workers: 4
+  prefetch_factor: 2
+  allow_pool_change: false     # true: a resume may continue on changed data (files, window, stride,
+                               # color_order); otherwise it refuses
+
+model:                         # architecture (= coupled_wm.world_model.models.G1_TOKENIZER_ARCH)
+  image_size: [256, 256]
+  patch_size: 16
+  in_channels: 3
+  d_model: 1024
+  n_layers: 16
+  num_heads_q: 16
+  num_heads_kv_latent: 16
+  temporal_every: 4            # layers 3, 7, 11, 15 attend causally over time
+  n_latents: 256
+  bottleneck_dim: 32           # latents per frame: 256 x 32, tanh-bounded
+  use_proprio: true
+  proprio_dim: 50
+  num_proprio: 1
+  seq_len: 64                  # temporal RoPE positions = training clip length
+  context_len: 0               # no temporal sliding window in the encoder
+  dropout: 0.0
+  mae_max_mask_prob: 0.9       # per frame, a fraction U(0, 0.9) of the patches is masked
+
+loss:
+  mse_weight: 1.0
+  lpips_weight: 0.2            # LPIPS-VGG on frames scaled to [-1, 1]
+  lpips_net: vgg
+  proprio_weight: 0.01
+  # Each term is divided by its running RMS: an EMA of the squared loss, updated every
+  # micro-step with decay rms_decay ** (micro_batch_per_gpu * GPUs / rms_reference_windows).
+  # rms_decay is thus the decay over rms_reference_windows windows: per micro-step on the
+  # paper's 64 GPUs x 1 window, and the same horizon in windows on any number of GPUs.
+  rms_decay: 0.99
+  rms_reference_windows: 64
+  rms_eps: 1.0e-8
+
+optim:                         # AdamW on all parameters (norms, tokens and biases included)
+  lr: 1.0e-4                   # peak learning rate
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.01
+  grad_clip: 1.0               # clipped separately for the encoder and the decoder
+
+schedule:                      # in optimizer updates of train.global_batch windows
+  warmup_updates: 1400
+  total_updates: 345360        # nominal length: 240 epochs of the paper data at batch 256
+  min_lr: 1.0e-8
+  max_updates: 45000           # where the paper run stopped
+
+train:
+  global_batch: 256            # windows per optimizer update, over all GPUs
+  micro_batch_per_gpu: 1       # accumulation steps = global_batch / (micro_batch_per_gpu * GPUs)
+  mixed_precision: true        # bf16 parameters, gradient reduction and buffers; fp32 master weights
+  sharding_strategy: FULL_SHARD
+  skip_threshold: 5.0          # skip an update whose raw loss exceeds 5x its running mean ...
+  skip_warmup_updates: 200     # ... after the first 200 updates
+  skip_ema_decay: 0.99
+  max_nonfinite_updates: 20    # stop after this many non-finite updates in a row (never applied)
+
+compile: reduce-overhead       # torch.compile mode for encoder and decoder, or false; needs a C
+                               # compiler and the Python headers (Triton builds a C module)
+
+checkpoint:
+  save_every_updates: 1000     # latest.pt (weights + optimizer + data position): ~34 min on 64 GPUs
+  save_every_minutes: 60       # ... and after 60 min without a save (on few GPUs an update is slow)
+  at_epoch_end: true
+  archive_every_updates: 2000  # weights-only pretrained dirs under archive/
+  keep_archives: 5
+
+logging:
+  print_every_updates: 200     # console (and the first 5 updates of each launch); TensorBoard: every update
+
+wandb:
+  enabled: false
+  mode: offline
+  project: coupled-wm
+  entity: null
+  name: null
+  group: null
+  tags: []
+
+dist:
+  backend: nccl
+  timeout_minutes: 30

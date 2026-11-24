@@ -1,0 +1,25 @@
+# Pinned versions of the direct dependencies, as in the environment that produced the paper results
+# (Python 3.10, CUDA 12.8 wheels). `pip install -r requirements.txt && pip install -e .`
+# The tests need the `test` extra (pytest is not pinned here): `pip install -e ".[test]"`.
+# Prebuilt wheels cover Python 3.10-3.12. On Python 3.13+ numpy 1.26.4 has no wheel: pip
+# builds it from source, which needs a C compiler (a slim base image fails).
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1
+torchvision==0.24.1
+numpy==1.26.4
+h5py==3.14.0
+PyYAML==6.0.2
+tensorboard==2.20.0
+# the `tensorboard` CLI imports pkg_resources, which recent setuptools releases no longer ship
+setuptools==80.9.0
+safetensors==0.6.2
+huggingface-hub==0.35.0
+lpips==0.1.4
+pillow==11.3.0
+# lpips dependencies, pinned to the paper environment
+scipy==1.15.3
+tqdm==4.67.1
+# Optional experiment tracking (wandb.enabled: true in a config):
+# wandb==0.21.4
+# Optional MP4 output of scripts/compare_rollouts.py (GIF without it; bundles an ffmpeg binary):
+# imageio-ffmpeg==0.6.0

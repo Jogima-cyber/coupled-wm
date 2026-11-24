@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: Apache-2.0
+# DMO on the G1 world model (grasp-and-lift, ego-centric camera): the G1 RL config of the
+# release re-run, i.e. the paper's settings except the values whose comments say otherwise.
+#
+#   torchrun --nproc_per_node=4 -m coupled_wm.rl.train --config configs/rl/g1_dmo.yaml \
+#       --seed 20 --logdir runs/g1_dmo/s20 --no-eval
+#
+# The paper ran each seed on 8 GPUs (2 nodes x 4 H100, --no-eval, seeds 20/30/40/50). Global
+# quantities are split over the ranks: num_actors, replay_size and rssm.batch_size must be
+# multiples of the world size (eval.player.num_actors too, under --play); min_replay is floored
+# and eval.num_episodes rounded up per rank. Paths are relative to the working directory (run
+# from the repository root) or set through WEIGHTS_DIR (the dir holding tokenizer/, dynamics/
+# and rssm/) and G1_DATA_ROOT (the dir holding new_wm_h5_segmented_small/).
+#
+# Memory per rank: the replay buffer holds replay_size / world_size rows of 49,246 bytes (64x64 fp32
+# frames): 45.9 GiB at 1 rank, 22.9 at 2, 11.5 at 4, 5.7 at 8 (train.replay_device: cpu keeps
+# it in host RAM; a GPU replay buffer larger than the GPU stops the run before the world model is
+# loaded). The env's share is below. SIGTERM or SIGUSR1 saves latest.pt at the end of the
+# current iteration and exits (see coupled_wm/rl/train.py); relaunching resumes.
+
+# The G1 world-model environment (coupled_wm.envs.DreamerV4VecEnvG1Relative). Every key is a
+# keyword argument of that class; the trainer adds num_envs (= num_actors / world_size), device
+# and episode_length (= train.max_episode_length). Values marked "paper" reproduce the
+# environment of the paper's G1 run.
+#
+# Env memory per GPU: 2.9 GB of world-model weights, KV caches of 0.55 GB per env (17.5 GB
+# at 32 envs), and the memory of the encoder call of every reset, which encodes envs x 32
+# frames at once. compile_encoder: reduce-overhead records that call as a CUDA graph, whose
+# memory (its CUDA-graph memory pool) stays reserved for the whole run: 19.73 GiB at 64 envs
+# on an H100. With the GPU replay buffer of this config, 1 x 80 GB
+# cannot hold it (KV caches + replay buffer = 119 GB), and on 2 x 80 GB the KV caches, the replay
+# buffer and the model weights (with the RSSM's optimizer state) take about 65 GB per GPU before the
+# encoder's memory and the training activations. The paper used 8 GPUs. With fewer, consider
+# train.replay_device: cpu and compile_encoder: false.
+env:
+  name: DreamerV4VecEnvG1Relative
+
+  # The global world model: pretrained dirs (scripts/download_weights.py) or training
+  # checkpoints that embed their model config.
+  tokenizer_ckpt: ${WEIGHTS_DIR:-weights}/tokenizer
+  dynamics_ckpt: ${WEIGHTS_DIR:-weights}/dynamics
+  verify_pairing: true             # check the tokenizer sha256 recorded with the dynamics
+
+  # Seed pool (paper): chunk_0021..chunk_0227 of the world-model data dir, 207 files,
+  # 530,003 windows of 32 frames. The dir also holds patch*.h5 files; the paper pool excludes
+  # them and the early chunks 0000-0020. Same keys as the data blocks of the world-model and
+  # RSSM configs; frames not stored at the tokenizer's image_size are resized as there.
+  data:
+    dirs:
+      - ${G1_DATA_ROOT:-data/g1}/new_wm_h5_segmented_small/world_model
+    file_list: null
+    include_globs: ["*.h5"]
+    exclude_globs: ["patch*"]
+    min_chunk_index: 21
+    # Channel order on disk; null = the order the tokenizer recorded (bgr for the G1 weights,
+    # whose frames are stored BGR; the models see RGB).
+    color_order: null
+    num_workers: 4                 # seed-window loading; 0 loads in the main process
+    prefetch_factor: 2
+    pin_memory: true
+  loader_seed: null                # null = global torch RNG (paper); an int pins the seed windows
+
+  img_size: 64                     # observation size; must match the RSSM's image_size
+
+  # Base velocity commands (vx, vy, yaw rate) are not controlled by the policy: the trainer
+  # sends zeros there. What they hold during an episode:
+  #   hold         the seed window's last base command, for all 64 steps (paper)
+  #   zero         0 from the first generated frame on
+  #   skip_nonzero only seed from windows whose last base command is 0, so the base stays at
+  #                0 (this config): 25,387 of the 530,003 windows of the paper pool (4.8%) are
+  #                excluded. The passes permute the 504,616 others, so a given seed no longer
+  #                draws the paper's windows.
+  drop_action_indices: [0, 1, 2]
+  dropped_dims_reset: skip_nonzero  # paper: hold
+
+  # Absolute-command clamp and generation constants; null = the dynamics config.json, else
+  # the paper's G1 values (a warning names any G1 value used that way). Paper: the symmetric
+  # G1 envelope, grips 20-21 in [0, 1]; 32 context frames, 32-frame KV cache, 4 Euler steps,
+  # cached frames at noise index 12 (seq_cor_tau_idx), reward MTP head 0.
+  # action_scale is the clamp of the integrated absolute command (env width), not the policy's
+  # per-step scale (actor.action_scale). For a world model trained on other data, check that
+  # its config.json holds that data's layout or set action_scale, grip_dims and grip_range here
+  # (python scripts/compute_action_envelope.py <data_dir> --grip-dims ... prints them).
+  action_scale: null
+  grip_dims: null
+  grip_range: null
+  init_context_len: null
+  kv_cache_len: null
+  num_inference_steps: null
+  seq_cor_tau_idx: null
+  reward_mtp_index: null
+
+  # The paper's setting. torch.compile needs a C compiler (gcc or clang, or CC) and the Python
+  # headers at run time; without them use false (eager: the encoder's memory is freed after
+  # each reset).
+  compile_encoder: reduce-overhead
+
+# Policy over the 19 controlled dims (env dims 3-21). action_scale is the per-step relative
+# command scale, tanh(u) * action_scale (not env.action_scale, the env's absolute clamp):
+# 0.02 rad for the 17 joints, 1.0 for the 2 grip channels (a full open/close in one step; the
+# env keeps the integrated grips in [0, 1]).
+actor:
+  name: SAPOActorStochasticMLP
+  units: [256, 128, 64]
+  activation: silu
+  action_scale: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
+                 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
+                 1.0, 1.0]
+  log_std_min: -5.0
+  log_std_max: 2.0
+
+# Ensemble of scalar MSE critics: the actor bootstraps with the ensemble mean, the TD targets
+# use the min of two random members. target_critic_alpha is the Polyak rate of the single-critic
+# target network (clipped_double_critic: false).
+critic:
+  name: CriticMLP
+  units: [256, 128, 64]
+  activation: silu
+  clipped_double_critic: true
+  num_critics: 10
+  target_critic_alpha: 0.2
+
+# The local world model (DreamerV3-style RSSM, XL at 64x64) and its online finetuning. action_size
+# and image_size come from the env.
+rssm:
+  # Warm start: a pretrained dir from coupled_wm.rssm.pretrain (run_dir/rssm_e10) or the HF
+  # weights; a bare state-dict .pt is also accepted. null = random init.
+  pretrained: ${WEIGHTS_DIR:-weights}/rssm
+  # The imagined prior's stochastic state in the actor's backward pass, in the DMO gradient
+  # swap and in the --no-diffusion imagination unroll. false (paper setting): the prior enters as
+  # its mode and the actor gradient flows through the deterministic state. true: adds the
+  # straight-through gradient of its categorical probs (forward values unchanged).
+  straight_through_stochastic_grad: false
+  sequence_length: 64
+  batch_size: 256                  # global (32 per rank on the paper's 8 GPUs)
+  stochastic_size: 32
+  discrete_size: 32
+  recurrent_state_size: 4096
+  dense_units: 1024
+  channels_multiplier: 96
+  mlp_layers: 5
+  reward_model_bins: 255           # two-hot over symlog bins on [-20, 20]
+  kl_dynamic: 0.5
+  kl_representation: 0.1
+  kl_free_nats: 1.0
+  kl_regularizer: 1.0
+  learning_rate: 1e-4              # Adam
+  init_udt: 10000                  # updates once the replay buffer is first filled, before the first actor update
+  udt: 64                          # updates per epoch (per rank)
+
+train:
+  max_epochs: 2000
+  num_actors: 128                  # global
+  max_episode_length: 64           # time limit; all envs reset together
+  steps_num: 16                    # unroll length of one actor update
+  gamma: 0.99
+  critic_method: td-lambda         # td-lambda | one-step
+  lambda: 0.95
+  lr_schedule: linear              # linear decay to the *_lr_schedule_min values | constant
+  actor_learning_rate: 2e-3        # AdamW (weight decay 0.01)
+  actor_lr_schedule_min: 1e-5
+  critic_learning_rate: 5e-4       # AdamW (weight decay 0.01)
+  critic_lr_schedule_min: 1e-5
+  betas: [0.7, 0.95]
+  critic_iterations: 8
+  num_batch: 2                     # critic minibatches per iteration (per rank, unshuffled)
+  grad_norm: 1.0
+  truncate_grads: true
+  # Entropy target of the temperature; must be below the policy's maximum attainable entropy
+  # (-53.51 for this action_scale and log_std range; checked at start-up).
+  target_entropy: -58
+  alpha_learning_rate: 5e-3        # Adam on log(alpha), alpha starts at 1
+  replay_size: 999936              # rows of the RSSM replay buffer (global)
+  # Replay buffer fill before training (global): 40960 / 128 envs = 320 env steps = 5 episodes of 64,
+  # so episode resets land between 16-step unrolls (paper: 40000).
+  min_replay: 40960
+  replay_device: cuda              # cuda | cpu
+  # Resume (a --logdir holding latest.pt). true: every save also writes each rank's replay
+  # buffer (replay/rank<r>.pt, up to replay_size / world_size rows) and a resumed run reloads it.
+  # false: a resumed run refills min_replay replay buffer rows with the current policy, then RSSM finetuning
+  # goes on with rssm.udt updates per iteration (rssm.init_udt runs once per run, not on resume).
+  checkpoint_replay: false
+  save_interval: 400               # iterations between resumable checkpoints (latest.pt)
+  # torch.compile the RSSM (as in the paper); needs a C compiler and the Python headers at run
+  # time, false = eager.
+  compile: true
+
+eval:
+  num_episodes: 1280               # global, deterministic policy, every `every` iterations
+  every: 50
+  player:                          # --play
+    num_actors: 1                  # global: a multiple of the world size
+    games_num: 1
+
+wandb:
+  enabled: false
+  mode: offline
+  project: coupled-wm

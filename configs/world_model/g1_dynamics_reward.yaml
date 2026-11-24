@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+# G1 dynamics, stage 2 of 2: reward head on top of the backbone (g1_dynamics_backbone.yaml).
+#
+#   torchrun --nproc_per_node=4 -m coupled_wm.world_model.train_dynamics \
+#       --config configs/world_model/g1_dynamics_reward.yaml [--set key=value ...]
+#
+# Starts from the backbone (init_from), which must have reached its own max_updates, with a
+# freshly initialised agent token and reward head, a fresh AdamW and a fresh schedule.
+# <run_dir>/pretrained/ is the dynamics model of the G1 environment. Run from the repository
+# root, or set RUN_ROOT to an absolute path (run_dir and init_from are relative otherwise);
+# re-running the same command resumes from <run_dir>/latest.pt. export.preset g1 writes the G1
+# environment constants and is for G1 data only. torch.compile needs a C compiler at run time
+# (see g1_dynamics_backbone.yaml; eager: --set compile=null --set tokenizer.compile=null).
+#
+# Paper run (64 H100): from the backbone at update 49000, reward head on, T=32 clips only, one
+# job stopped by the cluster's time limit after 3000 reward-stage updates (global update 52000),
+# still inside the warmup (lr 4.94e-6 of 5e-5). That checkpoint is the released dynamics model.
+# The schedule numbers below reproduce its stored learning rate exactly.
+
+stage: reward
+run_dir: ${RUN_ROOT:-runs}/g1_dynamics_reward
+seed: 42
+# The backbone's latest.pt (carries its loss-scaler state, as in the paper) or pretrained dir.
+init_from: ${RUN_ROOT:-runs}/g1_dynamics_backbone/latest.pt
+
+tokenizer:
+  # The tokenizer the backbone was trained with (a different sha256 raises). With your own
+  # tokenizer, set it here too: --set tokenizer.path=runs/g1_tokenizer/pretrained.
+  path: ${WEIGHTS_DIR:-weights}/tokenizer
+  context_len: 0        # as the backbone; null: the window the tokenizer was trained with
+  compile: max-autotune
+
+data:
+  # Paper reward-stage pool: all 290 files of the directory, i.e. the 228 chunk_*.h5 files plus
+  # 62 patch*_chunk_*.h5 files (752,861 frames, 739,956 windows of 32 frames).
+  dirs:
+    - ${G1_DATA_ROOT:-data/g1}/new_wm_h5_segmented_small/world_model
+  include_globs: ["*.h5"]
+  exclude_globs: []
+  color_order: null     # channel order on disk; null: the tokenizer's recorded order (G1: bgr)
+  reward_key: rewards
+  # Paper setting: reward 10.0 is mapped to 2.0. The G1 data only holds rewards {0, 1}, so this
+  # is a no-op here; remove it for data where 10.0 is a real reward.
+  reward_remap: {10.0: 2.0}
+  num_workers: 4
+  sampler_seed: 42
+  start_epoch: 1        # first shuffle of the data order: 1 as in the paper reward run (backbone: 0)
+
+model:
+  # Same backbone architecture as stage 1, plus (set by the stage) the agent token and an
+  # 8-step multi-token reward head: symlog two-hot over 255 bins in [-20, 20]; 681,631,768
+  # parameters in total.
+  action_dim: 22
+  num_latents: 256
+  latent_dim: 32
+  d_model: 1536
+  num_layers: 24
+  num_heads: 24
+  num_registers: 4
+  num_tau_levels: 128   # noise grid 1/128; 8 step sizes 2^0 .. 2^-7 (2^-7 = flow)
+  temporal_every: 4
+  mlp_ratio: 4.0
+  seq_len: 128
+  context_len: 96       # inactive at T=32
+  dropout: 0.0
+  mtp_length: 8
+  reward_hidden_dim: 512
+  reward_num_buckets: 255
+  reward_symlog_range: [-20.0, 20.0]
+
+train:
+  short_len: 32         # T=32 clips only
+  long_len: null
+  long_every: 0
+  global_batch: 256     # paper: 1 clip x 64 GPUs x 4 accumulation steps
+  micro_batch_per_gpu: 1
+  shortcut_fraction: 0.25   # every 4th micro-batch over (update, rank, micro-step): 3 flow + 1
+                            # shortcut per rank at 4 accumulation steps (paper), interleaved otherwise
+
+optim:
+  lr: 5.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  grad_clip: 1.0
+
+schedule:
+  # Nominal paper schedule: 210 epochs of 11561 micro-batches per rank (739,956 windows / 64
+  # ranks) at 4 accumulation steps: total = 210 * 11561 // 4, warmup = int(0.05 * total).
+  warmup_updates: 30347
+  total_updates: 606952
+  min_lr: 1.0e-8
+  max_updates: 3000     # where the paper reward stage stopped
+
+loss:
+  # Each term is divided by its running RMS: an EMA of the squared loss, updated every
+  # micro-step with decay rms_decay ** (micro_batch_per_gpu * GPUs / rms_reference_windows).
+  # rms_decay is thus the decay over rms_reference_windows clips: per micro-step on the
+  # paper's 64 GPUs x 1 clip, and the same horizon in clips on any number of GPUs.
+  rms_decay: 0.99
+  rms_reference_windows: 64
+  rms_eps: 1.0e-8
+
+compile: max-autotune-no-cudagraphs
+
+checkpoint:
+  save_every_updates: 1000
+  save_every_minutes: 30  # also on wall time: on few GPUs 1000 updates take hours
+  archive_every_updates: null
+  export_on_save: false
+
+export:
+  # Writes the G1 environment constants (inference loop, action layout, control rate) into
+  # pretrained/config.json. G1 data only: for another robot set preset: null and give
+  # export.metadata.action (scripts/compute_action_envelope.py) and export.metadata.inference.
+  preset: g1
+
+logging:
+  print_every_updates: 200
+
+wandb:
+  enabled: false
+  mode: offline
+  project: coupled-wm
